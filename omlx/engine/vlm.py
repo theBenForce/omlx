@@ -65,10 +65,17 @@ from ..patches.gemma4_audio import apply_gemma4_audio_patch
 from ..patches.inkling2 import INKLING2_MODEL_TYPES
 from ..patches.inkling2 import vlm as inkling2_vlm
 from ..patches.inkling2.loopcd import apply_loopcd
-from ..patches.mlx_lm_mtp import drafter_target
+from ..patches.mlx_lm_mtp import (
+    drafter_target,
+    get_mtp_depth,
+    is_mtp_active,
+    is_mtp_depth_fixed,
+)
 from ..patches.mlx_vlm_minimax_m3_compat import a8 as minimax_a8
+from ..patches.mlx_vlm_mtp.bonsai_v2_sidecar import bind_bonsai_v2_mtp_sidecar
 from ..patches.mlx_vlm_pixtral_torch_free import apply_pixtral_torch_free_patch
 from ..patches.muse_spark import model as muse_spark_model
+from ..patches.prism_hadamard_verify import PRISM_HADAMARD_MODEL_TYPE
 from ..prefill_helper.adapters import adapter_for_model as stage_adapter_for
 from ..prefill_helper.manager import PrefillHelperManager
 from ..reasoning_effort import apply_chat_template_with_reasoning_effort_fallback
@@ -1985,6 +1992,9 @@ class VLMBatchedEngine(BaseEngine):
         # Apply pre-load patches (MTP runtime patch, etc.) before the model
         # is instantiated, so the patched ``__init__`` runs. ``maybe_apply``
         # is a no-op when the model is incompatible.
+        mtp_active = False
+        mtp_depth = 3
+        mtp_depth_fixed = False
         try:
             from ..utils.model_loading import maybe_apply_pre_load_patches
 
@@ -1993,6 +2003,9 @@ class VLMBatchedEngine(BaseEngine):
                 model_settings=self._model_settings,
                 for_vlm=True,
             )
+            mtp_active = is_mtp_active()
+            mtp_depth = get_mtp_depth()
+            mtp_depth_fixed = is_mtp_depth_fixed()
         except ValueError:
             raise
         except Exception as e:
@@ -2125,6 +2138,20 @@ class VLMBatchedEngine(BaseEngine):
                         self._model_name,
                         **load_kwargs,
                     )
+                    if (
+                        model_type == PRISM_HADAMARD_MODEL_TYPE
+                        and mtp_active
+                        and bind_bonsai_v2_mtp_sidecar(
+                            loaded[0],
+                            self._model_name,
+                            depth=mtp_depth,
+                            depth_fixed=mtp_depth_fixed,
+                        )
+                    ):
+                        logger.info(
+                            "Bound Ternary Bonsai Lightning MTP sidecar for %s",
+                            self._model_name,
+                        )
                     return loaded
 
         loop = asyncio.get_running_loop()

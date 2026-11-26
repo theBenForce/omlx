@@ -24,7 +24,11 @@ from statistics import median
 from types import SimpleNamespace
 from typing import Any, Deque, Dict, List, Optional, Tuple
 
+import mlx.core as mx
+import mlx.nn as nn
+
 from omlx.prefill_progress import get_prefill_tracker
+from omlx.utils.sampling import top_k_indices
 
 from . import cache_rollback as _rollback_mod
 from . import context_copy as _context_copy
@@ -1842,6 +1846,7 @@ _COARSE_HEAD_BITS = 3
 _COARSE_HEAD_GROUP = 128
 _COARSE_CANDIDATES = 64
 _COARSE_MIN_VOCAB = 65536
+_DIRECT_COARSE = object()
 _COARSE_HEADS: Dict[int, Any] = {}
 
 
@@ -1867,15 +1872,22 @@ class _CoarseDraftHead:
         The candidates normalize among themselves: the coarse logits are too
         narrow to estimate the vocabulary's normalizer.
         """
-        import mlx.core as mx
-
-        from omlx.utils.sampling import top_k_indices
-
         head = self.lang.lm_head
-        approx = self.coarse(h[:, -1, :]).astype(mx.float32)
+        x = h[:, -1, :]
+        if self.coarse is head:
+            approx = head(x)
+            ids = top_k_indices(approx, _COARSE_CANDIDATES)
+            exact = mx.take_along_axis(approx, ids, axis=-1).astype(mx.float32)
+            return ids, exact - mx.logsumexp(exact, axis=-1, keepdims=True)
+        if x.dtype != self.coarse.scales.dtype:
+            x = x.astype(self.coarse.scales.dtype)
+        rotate = getattr(head, "rotated_input", None)
+        if callable(rotate):
+            x = rotate(x)
+        approx = self.coarse(x).astype(mx.float32)
         ids = top_k_indices(approx, _COARSE_CANDIDATES)
         exact = mx.quantized_matmul(
-            h[:, -1, :],
+            x,
             *_head_rows(head, ids.reshape(-1)),
             transpose=True,
             group_size=head.group_size,
@@ -1988,8 +2000,9 @@ _CANDIDATE_SAMPLE_KERNEL = None
 
 def _sample_candidates_fused(sampler, lp, top_k: int):
     """``_sample_draft_sparse`` for ``(1, M)`` log-probs, M <= 64, top_k <= 32."""
-    import mlx.core as mx
-
+    if not (mx.metal.is_available() and mx.default_device() == mx.gpu):
+        token, ids, logq = _sample_draft_sparse(sampler, lp, top_k)
+        return token.astype(mx.int32), ids, logq
     global _CANDIDATE_SAMPLE_KERNEL
     if _CANDIDATE_SAMPLE_KERNEL is None:
         _CANDIDATE_SAMPLE_KERNEL = mx.fast.metal_kernel(
@@ -2026,9 +2039,6 @@ def _quantize_mtp_fc(mtp) -> None:
     Checkpoints keep it in bf16; at 4 bits the head's first-step acceptance
     is unchanged on code and Korean text and each draft step reads 76 MB less.
     """
-    import mlx.core as mx
-    import mlx.nn as nn
-
     fc = getattr(mtp, "fc", None)
     if (
         type(fc) is not nn.Linear
@@ -2041,15 +2051,7 @@ def _quantize_mtp_fc(mtp) -> None:
     mx.eval(mtp.fc.parameters())
 
 
-def _coarse_draft_head(model) -> Optional[_CoarseDraftHead]:
-    """The coarse chain head for Qwen3.5/Qwen4 MTP with a quantized lm_head.
-
-    The first call per head builds the coarse copy and stores the MTP ``fc``
-    at 4 bits.
-    """
-    import mlx.core as mx
-    import mlx.nn as nn
-
+def _coarse_draft_head(model):
     lang = _mtp_language_model(model)
     head = getattr(lang, "lm_head", None)
     mtp = _mtp_module(lang)
@@ -2058,44 +2060,55 @@ def _coarse_draft_head(model) -> Optional[_CoarseDraftHead]:
         not getattr(forward, "_omlx_lm_head_logits", False)
         or mtp is None
         or getattr(getattr(lang, "args", None), "tie_word_embeddings", True)
-        or not (isinstance(head, nn.QuantizedLinear) or hasattr(head, "quantized_rows"))
+        or not (
+            isinstance(head, nn.QuantizedLinear)
+            or hasattr(head, "quantized_rows")
+            or (
+                callable(getattr(head, "rotated_input", None))
+                and isinstance(getattr(head, "weight", None), mx.array)
+                and isinstance(getattr(head, "scales", None), mx.array)
+                and isinstance(getattr(head, "biases", None), mx.array)
+            )
+        )
         or getattr(head, "mode", "affine") != "affine"
         or "bias" in head
         or _head_vocab(head) < _COARSE_MIN_VOCAB
     ):
         return None
-    coarse = _COARSE_HEADS.get(id(head))
-    if coarse is None:
+    entry = _COARSE_HEADS.get(id(head))
+    if entry is None:
         _quantize_mtp_fc(mtp)
-        rows = _head_vocab(head)
-        parts = []
-        for start in range(0, rows, 16384):
-            end = min(rows, start + 16384)
-            weight = mx.dequantize(
-                *_head_rows(head, mx.arange(start, end)),
-                group_size=head.group_size,
-                bits=head.bits,
+        if int(head.bits) <= _COARSE_HEAD_BITS:
+            entry = _DIRECT_COARSE
+        else:
+            rows = _head_vocab(head)
+            parts = []
+            for start in range(0, rows, 16384):
+                end = min(rows, start + 16384)
+                weight = mx.dequantize(
+                    *_head_rows(head, mx.arange(start, end)),
+                    group_size=head.group_size,
+                    bits=head.bits,
+                )
+                part = mx.quantize(
+                    weight, group_size=_COARSE_HEAD_GROUP, bits=_COARSE_HEAD_BITS
+                )
+                mx.eval(part)
+                parts.append(part)
+            entry = nn.QuantizedLinear(
+                int(weight.shape[1]),
+                rows,
+                bias=False,
+                group_size=_COARSE_HEAD_GROUP,
+                bits=_COARSE_HEAD_BITS,
             )
-            part = mx.quantize(
-                weight, group_size=_COARSE_HEAD_GROUP, bits=_COARSE_HEAD_BITS
+            entry.weight, entry.scales, entry.biases = (
+                mx.concatenate([part[i] for part in parts], axis=0) for i in range(3)
             )
-            mx.eval(part)
-            parts.append(part)
-        coarse = nn.QuantizedLinear(
-            int(weight.shape[1]),
-            rows,
-            bias=False,
-            group_size=_COARSE_HEAD_GROUP,
-            bits=_COARSE_HEAD_BITS,
-        )
-        coarse.weight, coarse.scales, coarse.biases = (
-            mx.concatenate([part[i] for part in parts], axis=0) for i in range(3)
-        )
-        mx.eval(coarse.parameters())
-        _COARSE_HEADS[id(head)] = coarse
-        # The copy lives as long as its model.
+            mx.eval(entry.parameters())
+        _COARSE_HEADS[id(head)] = entry
         weakref.finalize(head, _COARSE_HEADS.pop, id(head), None)
-    return _CoarseDraftHead(lang, mtp, coarse)
+    return _CoarseDraftHead(lang, mtp, head if entry is _DIRECT_COARSE else entry)
 
 
 def _trim_token_buffer(gen_batch: Any, n: int) -> None:
